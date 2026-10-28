@@ -1,0 +1,77 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  ECR_REPOSITORY: lab-repo-ac643e5v
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: latest
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          # Latest image digest will be needed for Inspector
+          echo "image_digest=$(docker inspect --format='{{index .RepoDigests 0}}' $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG | cut -d'@' -f2)" >> $GITHUB_OUTPUT
+
+      - name: Wait for Inspector Scan
+        run: |
+          echo "Waiting for Amazon Inspector to analyse the image (30s initial wait)..."
+          sleep 30
+
+      - name: Inspect Image for Vulnerabilities
+        run: |
+          # Latest image digest is needed here
+          DIGEST=$(aws ecr describe-images --repository-name ${{ env.ECR_REPOSITORY }} --image-ids imageTag=latest --query 'imageDetails[0].imageDigest' --output text)
+          
+          echo "Checking vulnerabilities for $DIGEST..."
+          
+          # Check Inspector
+          for i in {1..6}; do
+            FINDINGS=$(aws inspector2 list-findings \
+              --filter-criteria "{\"ecrImageHash\": [{\"comparison\": \"EQUALS\", \"value\": \"$DIGEST\"}], \"findingStatus\": [{\"comparison\": \"EQUALS\", \"value\": \"ACTIVE\"}], \"severity\": [{\"comparison\": \"EQUALS\", \"value\": \"CRITICAL\"}]}" \
+              --query "findings" --output json)
+            
+            COUNT=$(echo $FINDINGS | jq 'length')
+            
+            if [ "$COUNT" -gt 0 ]; then
+              echo "❌ SECURITY ALERT: Found $COUNT CRITICAL vulnerabilities!"
+              echo $FINDINGS | jq '.[] | {findingArn, title, severity}'
+              exit 1
+            fi
+            
+            echo "Attempt $i/10: no Critical findings yet — waiting 10s..."
+            sleep 10
+          done
+          
+          echo "✅ Security check passed. No critical vulnerabilities found."
+
+      - name: Update ECS Service
+        run: |
+          # Force Fargate to re-read :latest tag
+          aws ecs update-service \
+            --cluster cmtr-ac643e5v-ecs_cluster \
+            --service cmtr-ac643e5v-ecs_service \
+            --force-new-deployment
